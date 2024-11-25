@@ -44,7 +44,7 @@ def check_ollama_health():
         response = requests.post(
             OLLAMA_API_URL,
             json={'model': OLLAMA_MODEL, 'prompt': 'test', 'stream': False},
-            timeout=5
+            timeout=1000
         )
         return response.status_code == 200
     except Exception as e:
