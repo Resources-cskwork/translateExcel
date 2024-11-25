@@ -77,13 +77,60 @@ def batch_translate(texts, context):
     if not texts:
         return []
     
-    combined_text = "\n---SPLIT---\n".join(texts)
-    combined_translation = translate_with_context(combined_text, context)
+    try:
+        # First attempt: batch translation
+        combined_text = "\n---SPLIT---\n".join(texts)
+        combined_translation = translate_with_context(combined_text, context)
+        
+        if not combined_translation:
+            logger.warning("Batch translation returned empty result, trying individual translations")
+            return retry_failed_translations(texts, None, context)
+        
+        translations = combined_translation.split("\n---SPLIT---\n")
+        
+        # If we got fewer translations than input texts, retry the missing ones
+        if len(translations) != len(texts):
+            logger.warning(f"Translation count mismatch (got {len(translations)}, expected {len(texts)}), retrying failed translations")
+            return retry_failed_translations(texts, translations, context)
+            
+        return translations
+    except Exception as e:
+        logger.error(f"Batch translation failed: {str(e)}, trying individual translations")
+        return retry_failed_translations(texts, None, context)
+
+def retry_failed_translations(original_texts, partial_translations=None, context=None):
+    """Retry failed translations individually."""
+    final_translations = []
     
-    if not combined_translation:
-        return [""] * len(texts)
+    # If we have partial translations, use them where available
+    if partial_translations:
+        valid_translations = partial_translations[:len(original_texts)]
+    else:
+        valid_translations = [None] * len(original_texts)
     
-    return combined_translation.split("\n---SPLIT---\n")
+    for idx, (orig_text, trans) in enumerate(zip(original_texts, valid_translations)):
+        if trans:  # Use existing translation if available
+            final_translations.append(trans)
+            continue
+            
+        # Try individual translation up to 3 times
+        success = False
+        for attempt in range(3):
+            try:
+                individual_translation = translate_with_context(orig_text, context)
+                if individual_translation and individual_translation.strip():
+                    final_translations.append(individual_translation)
+                    success = True
+                    break
+            except Exception as e:
+                logger.error(f"Individual translation attempt {attempt + 1} failed for text: {orig_text[:100]}... Error: {str(e)}")
+                time.sleep(1)  # Wait before retry
+        
+        if not success:
+            logger.warning(f"All individual translation attempts failed for text: {orig_text[:100]}...")
+            final_translations.append(orig_text)  # Use original if all retries fail
+    
+    return final_translations
 
 def process_cell_batch(batch, context):
     """Process a batch of cells in parallel."""
@@ -235,6 +282,10 @@ def translate_text(text, context=None):
 
 def translate_with_context(text, context=None):
     """Translate text with context awareness and retries."""
+    if not text:
+        return text
+        
+    original_text = text
     for attempt in range(MAX_RETRIES):
         try:
             context_str = ""
@@ -288,30 +339,39 @@ Important: Provide ONLY the English translation without any explanations or note
                 timeout=30
             )
             
-            if response.status_code == 200:
-                result = response.json()
-                translated_text = result['response'].strip()
-                translated_text = translated_text.strip('"\'')
-                logger.info(f"Translation completed: {translated_text[:200]}")
-                return translated_text
-            else:
-                if attempt == MAX_RETRIES - 1:
-                    logger.error(f"Translation API error: {response.status_code}")
-                    return text
+            if response.status_code != 200:
+                logger.error(f"Translation API error: {response.status_code}")
                 continue
                 
-        except requests.Timeout:
-            if attempt == MAX_RETRIES - 1:
-                logger.error("Translation request timed out")
-                return text
-            continue
+            result = response.json()
+            if not result.get('response'):
+                logger.error("Empty translation response")
+                continue
+                
+            return result['response'].strip()
+            
         except Exception as e:
+            logger.error(f"Translation attempt {attempt + 1} failed: {str(e)}")
             if attempt == MAX_RETRIES - 1:
-                logger.error(f"Translation error: {str(e)}")
-                return text
+                logger.warning(f"All translation attempts failed, returning original text: {original_text[:100]}...")
+                return original_text
             continue
         
         time.sleep(1)  # Wait before retry
+    
+    return original_text  # Return original if all retries failed
+
+def is_numeric_string(text):
+    """Check if a string contains only numbers, decimals, and basic number formatting."""
+    if not isinstance(text, str):
+        return False
+    # Remove common number formatting characters
+    cleaned = text.replace(',', '').replace('$', '').replace('%', '').strip()
+    try:
+        float(cleaned)
+        return True
+    except ValueError:
+        return False
 
 def process_excel(file):
     logger.info("Starting Excel processing")
@@ -388,7 +448,7 @@ def process_sheet(sheet, new_sheet, context):
                     new_cell.alignment = copy.copy(cell.alignment)
                 
                 # Add to translation batch if needed
-                if cell.value and isinstance(cell.value, str):
+                if cell.value and isinstance(cell.value, str) and not is_numeric_string(cell.value):
                     cells_to_process.append((new_cell, cell.value))
                 else:
                     new_cell.value = cell.value
