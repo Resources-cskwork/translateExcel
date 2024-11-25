@@ -15,6 +15,7 @@ import queue
 import time
 from datetime import datetime
 from werkzeug.utils import secure_filename
+from itertools import zip_longest
 
 # Constants and Configuration
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB limit
@@ -72,6 +73,16 @@ def cached_translate(text, context_hash=None):
     """Cache translation results for repeated text."""
     return translate_with_context(text, context_hash)
 
+def clean_translation(text):
+    """Clean translation output by removing separators and extra whitespace."""
+    if not text:
+        return text
+    # Remove the separator and any surrounding whitespace
+    cleaned = text.replace("---SPLIT---", "").strip()
+    # Remove any extra newlines that might have been added
+    cleaned = " ".join(line.strip() for line in cleaned.splitlines())
+    return cleaned
+
 def batch_translate(texts, context):
     """Translate multiple texts in a single API call."""
     if not texts:
@@ -86,17 +97,24 @@ def batch_translate(texts, context):
             logger.warning("Batch translation returned empty result, trying individual translations")
             return retry_failed_translations(texts, None, context)
         
-        translations = combined_translation.split("\n---SPLIT---\n")
+        # Split and clean translations
+        translations = [clean_translation(t) for t in combined_translation.split("\n---SPLIT---\n")]
         
-        # If we got fewer translations than input texts, retry the missing ones
-        if len(translations) != len(texts):
-            logger.warning(f"Translation count mismatch (got {len(translations)}, expected {len(texts)}), retrying failed translations")
-            return retry_failed_translations(texts, translations, context)
-            
-        return translations
+        # Validate each translation
+        validated_translations = []
+        for idx, (orig_text, trans) in enumerate(zip_longest(texts, translations)):
+            if not trans or trans.isspace():
+                logger.warning(f"Empty translation at index {idx} for text: {orig_text}")
+                retry_result = retry_failed_translations([orig_text], None, context)
+                validated_translations.append(clean_translation(retry_result[0]) if retry_result else orig_text)
+            else:
+                validated_translations.append(trans)
+        
+        return validated_translations
+        
     except Exception as e:
         logger.error(f"Batch translation failed: {str(e)}, trying individual translations")
-        return retry_failed_translations(texts, None, context)
+        return [clean_translation(t) for t in retry_failed_translations(texts, None, context)]
 
 def retry_failed_translations(original_texts, partial_translations=None, context=None):
     """Retry failed translations individually."""
@@ -110,7 +128,7 @@ def retry_failed_translations(original_texts, partial_translations=None, context
     
     for idx, (orig_text, trans) in enumerate(zip(original_texts, valid_translations)):
         if trans:  # Use existing translation if available
-            final_translations.append(trans)
+            final_translations.append(clean_translation(trans))
             continue
             
         # Try individual translation up to 3 times
@@ -119,7 +137,7 @@ def retry_failed_translations(original_texts, partial_translations=None, context
             try:
                 individual_translation = translate_with_context(orig_text, context)
                 if individual_translation and individual_translation.strip():
-                    final_translations.append(individual_translation)
+                    final_translations.append(clean_translation(individual_translation))
                     success = True
                     break
             except Exception as e:
@@ -134,19 +152,70 @@ def retry_failed_translations(original_texts, partial_translations=None, context
 
 def process_cell_batch(batch, context):
     """Process a batch of cells in parallel."""
-    unique_texts = {}
-    for cell, text in batch:
-        if text:
-            unique_texts[text] = unique_texts.get(text, []) + [cell]
+    # Create a mapping to preserve order and cell positions
+    text_to_cells = {}  # Maps text to list of cells
+    ordered_texts = []  # Preserve original text order
+    cell_positions = {} # Maps text to original positions
     
-    # Translate unique texts
-    translations = batch_translate(list(unique_texts.keys()), context)
+    # Track cells that need translation
+    cells_to_translate = []
+    for idx, (cell, text) in enumerate(batch):
+        if text and isinstance(text, str) and not is_numeric_string(text):
+            cells_to_translate.append((idx, cell, text))
+            if text not in text_to_cells:
+                text_to_cells[text] = []
+                ordered_texts.append(text)
+                cell_positions[text] = idx
+            text_to_cells[text].append(cell)
     
-    # Apply translations back to cells
-    results = []
-    for text, translation in zip(unique_texts.keys(), translations):
-        for cell in unique_texts[text]:
-            results.append((cell, translation))
+    if not ordered_texts:  # No texts need translation
+        return batch
+    
+    # Translate unique texts while preserving order
+    translations = batch_translate(ordered_texts, context)
+    
+    # Verify translations
+    if len(translations) != len(ordered_texts):
+        logger.error(f"Translation count mismatch: got {len(translations)}, expected {len(ordered_texts)}")
+        logger.error(f"Original texts: {ordered_texts}")
+        logger.error(f"Translations received: {translations}")
+        # Retry missing translations individually
+        fixed_translations = []
+        for idx, text in enumerate(ordered_texts):
+            if idx < len(translations) and translations[idx]:
+                fixed_translations.append(translations[idx])
+            else:
+                logger.warning(f"Retrying missing translation for text: {text}")
+                retry_result = retry_failed_translations([text], None, context)
+                fixed_translations.append(retry_result[0] if retry_result else text)
+        translations = fixed_translations
+    
+    # Create results in the original cell order
+    results = list(batch)  # Start with original batch
+    translation_count = 0
+    
+    for text, translation in zip(ordered_texts, translations):
+        if not translation or translation.isspace():
+            logger.warning(f"Empty translation received for text: {text}")
+            continue
+            
+        for cell in text_to_cells[text]:
+            orig_idx = next(idx for idx, (c, t) in enumerate(batch) if c == cell)
+            results[orig_idx] = (cell, translation)
+            translation_count += 1
+    
+    # Verify all cells that needed translation were processed
+    expected_translations = len(cells_to_translate)
+    if translation_count != expected_translations:
+        logger.error(f"Missing translations: processed {translation_count} out of {expected_translations} cells")
+        # List cells that weren't translated
+        for idx, cell, text in cells_to_translate:
+            if results[idx][1] == text:  # Still has original text
+                logger.error(f"Cell at position {idx} (value: {text}) was not translated")
+                # One final attempt to translate
+                retry_result = retry_failed_translations([text], None, context)
+                if retry_result and retry_result[0] != text:
+                    results[idx] = (cell, retry_result[0])
     
     return results
 
