@@ -7,12 +7,61 @@ import requests
 import json
 import copy
 import random
+import concurrent.futures
+from functools import lru_cache
+from collections import defaultdict
+import threading
+import queue
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+
+# Thread-safe translation cache
+translation_cache = {}
+cache_lock = threading.Lock()
+
+# Translation queue for batch processing
+translation_queue = queue.Queue()
+BATCH_SIZE = 10
+
+@lru_cache(maxsize=1000)
+def cached_translate(text, context_hash=None):
+    """Cache translation results for repeated text."""
+    return translate_with_context(text, context_hash)
+
+def batch_translate(texts, context):
+    """Translate multiple texts in a single API call."""
+    if not texts:
+        return []
+    
+    combined_text = "\n---SPLIT---\n".join(texts)
+    combined_translation = translate_with_context(combined_text, context)
+    
+    if not combined_translation:
+        return [""] * len(texts)
+    
+    return combined_translation.split("\n---SPLIT---\n")
+
+def process_cell_batch(batch, context):
+    """Process a batch of cells in parallel."""
+    unique_texts = {}
+    for cell, text in batch:
+        if text:
+            unique_texts[text] = unique_texts.get(text, []) + [cell]
+    
+    # Translate unique texts
+    translations = batch_translate(list(unique_texts.keys()), context)
+    
+    # Apply translations back to cells
+    results = []
+    for text, translation in zip(unique_texts.keys(), translations):
+        for cell in unique_texts[text]:
+            results.append((cell, translation))
+    
+    return results
 
 def analyze_excel_structure(workbook, max_items=50):
     """Analyze Excel file structure and content to build context."""
@@ -170,7 +219,7 @@ def translate_with_context(text, context=None):
         prompt = f"""You are a professional Korean to English translator specializing in business documents and Excel spreadsheets.
 Please translate the following Korean text to English:
 
-Text to translate: {text[:500]}  # Limit input text size
+Text to translate: {text[:600]}  # Limit input text size
 
 {context_str[:1000]}  # Limit context size
 
@@ -189,7 +238,7 @@ Important: Provide ONLY the English translation without any explanations or note
         response = requests.post(
             'http://localhost:11434/api/generate', 
             json={
-                'model': 'mistral:7b-instruct',
+                'model': 'mistral-nemo:latest',
                 'prompt': prompt,
                 'stream': False,
                 'temperature': 0.3,
@@ -218,116 +267,96 @@ Important: Provide ONLY the English translation without any explanations or note
 def process_excel(file):
     logger.info("Starting Excel processing")
     try:
-        # Read the file
-        logger.info("Loading workbook")
-        wb = openpyxl.load_workbook(filename=io.BytesIO(file.read()))
+        workbook = openpyxl.load_workbook(file)
+        context = analyze_excel_structure(workbook)
         
-        # Analyze the Excel structure first
-        context = analyze_excel_structure(wb)
-        logger.info("Excel structure analyzed")
-        
-        # Create a new workbook for the translated content
+        # Create output workbook
         new_wb = openpyxl.Workbook()
-        new_wb.remove(new_wb.active)
+        new_wb.remove(new_wb.active)  # Remove default sheet
         
-        # Process each sheet
-        for sheet_name in wb.sheetnames:
-            logger.info(f"Processing sheet: {sheet_name}")
-            sheet = wb[sheet_name]
-            new_sheet = new_wb.create_sheet(title=sheet_name)
+        # Process sheets in parallel
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(workbook.sheetnames))) as executor:
+            futures = []
+            for sheet_name in workbook.sheetnames:
+                sheet = workbook[sheet_name]
+                new_sheet = new_wb.create_sheet(title=sheet_name)
+                
+                # Copy sheet properties
+                if sheet.sheet_format:
+                    new_sheet.sheet_format = copy.copy(sheet.sheet_format)
+                if sheet.sheet_properties:
+                    new_sheet.sheet_properties = copy.copy(sheet.sheet_properties)
+                
+                # Submit sheet processing task
+                futures.append(executor.submit(process_sheet, sheet, new_sheet, context))
             
-            # Copy sheet properties
-            new_sheet.sheet_properties = copy.copy(sheet.sheet_properties)
-            new_sheet.sheet_format = copy.copy(sheet.sheet_format)
-            new_sheet.merged_cells = copy.copy(sheet.merged_cells)
-            
-            # Copy dimensions
-            for key, value in sheet.column_dimensions.items():
-                new_sheet.column_dimensions[key] = copy.copy(value)
-            for key, value in sheet.row_dimensions.items():
-                new_sheet.row_dimensions[key] = copy.copy(value)
-            
-            # Process cells with context
-            for row in sheet.iter_rows():
-                for cell in row:
-                    new_cell = new_sheet.cell(row=cell.row, column=cell.column)
-                    
-                    if isinstance(cell, MergedCell):
-                        continue
-                    
-                    # Copy formatting
-                    if cell.has_style:
-                        if cell.font:
-                            font_props = {
-                                'name': cell.font.name,
-                                'size': cell.font.size,
-                                'bold': cell.font.bold,
-                                'italic': cell.font.italic,
-                                'vertAlign': cell.font.vertAlign,
-                                'underline': cell.font.underline,
-                                'strike': cell.font.strike,
-                                'color': copy.copy(cell.font.color) if cell.font.color else None
-                            }
-                            new_cell.font = openpyxl.styles.Font(**{k: v for k, v in font_props.items() if v is not None})
-                        
-                        if cell.border:
-                            border_props = {
-                                'left': copy.copy(cell.border.left),
-                                'right': copy.copy(cell.border.right),
-                                'top': copy.copy(cell.border.top),
-                                'bottom': copy.copy(cell.border.bottom),
-                                'diagonal': copy.copy(cell.border.diagonal),
-                                'diagonal_direction': cell.border.diagonal_direction,
-                                'outline': cell.border.outline,
-                                'vertical': copy.copy(cell.border.vertical),
-                                'horizontal': copy.copy(cell.border.horizontal)
-                            }
-                            new_cell.border = openpyxl.styles.Border(**border_props)
-                        
-                        if cell.fill:
-                            if cell.fill.fill_type == 'solid':
-                                new_cell.fill = openpyxl.styles.PatternFill(
-                                    fill_type='solid',
-                                    start_color=copy.copy(cell.fill.start_color),
-                                    end_color=copy.copy(cell.fill.end_color)
-                                )
-                            else:
-                                new_cell.fill = copy.copy(cell.fill)
-                        
-                        new_cell.number_format = cell.number_format
-                        
-                        if cell.alignment:
-                            align_props = {
-                                'horizontal': cell.alignment.horizontal,
-                                'vertical': cell.alignment.vertical,
-                                'text_rotation': cell.alignment.text_rotation,
-                                'wrap_text': cell.alignment.wrap_text,
-                                'shrink_to_fit': cell.alignment.shrink_to_fit,
-                                'indent': cell.alignment.indent,
-                                'justifyLastLine': cell.alignment.justifyLastLine,
-                                'readingOrder': cell.alignment.readingOrder
-                            }
-                            new_cell.alignment = openpyxl.styles.Alignment(**{k: v for k, v in align_props.items() if v is not None})
-                        
-                        if cell.protection:
-                            new_cell.protection = copy.copy(cell.protection)
-                    
-                    # Translate content with context
-                    if cell.value:
-                        if isinstance(cell.value, str):
-                            new_cell.value = translate_text(cell.value, context)
-                        else:
-                            new_cell.value = cell.value
-                    else:
-                        new_cell.value = cell.value
+            # Wait for all sheets to complete
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    logger.error(f"Error processing sheet: {str(e)}")
         
         # Save to buffer
         buffer = io.BytesIO()
         new_wb.save(buffer)
         buffer.seek(0)
         return buffer
+        
     except Exception as e:
-        logger.error(f"Error processing Excel file: {str(e)}", exc_info=True)
+        logger.error(f"Error in process_excel: {str(e)}")
+        raise
+
+def process_sheet(sheet, new_sheet, context):
+    """Process a single sheet with batched cell processing."""
+    try:
+        # Copy sheet dimensions
+        for key, value in sheet.column_dimensions.items():
+            new_sheet.column_dimensions[key] = copy.copy(value)
+        for key, value in sheet.row_dimensions.items():
+            new_sheet.row_dimensions[key] = copy.copy(value)
+        
+        # Copy merged cells
+        if sheet.merged_cells:
+            new_sheet.merged_cells = copy.copy(sheet.merged_cells)
+        
+        # Collect cells for batch processing
+        cells_to_process = []
+        for row in sheet.iter_rows():
+            for cell in row:
+                if isinstance(cell, MergedCell):
+                    continue
+                
+                new_cell = new_sheet.cell(row=cell.row, column=cell.column)
+                
+                # Copy cell formatting
+                if cell.has_style:
+                    new_cell.font = copy.copy(cell.font)
+                    new_cell.border = copy.copy(cell.border)
+                    new_cell.fill = copy.copy(cell.fill)
+                    new_cell.number_format = copy.copy(cell.number_format)
+                    new_cell.protection = copy.copy(cell.protection)
+                    new_cell.alignment = copy.copy(cell.alignment)
+                
+                # Add to translation batch if needed
+                if cell.value and isinstance(cell.value, str):
+                    cells_to_process.append((new_cell, cell.value))
+                else:
+                    new_cell.value = cell.value
+        
+        # Process cells in batches
+        for i in range(0, len(cells_to_process), BATCH_SIZE):
+            batch = cells_to_process[i:i + BATCH_SIZE]
+            results = process_cell_batch(batch, context)
+            
+            # Apply translations
+            for cell, translation in results:
+                cell.value = translation
+        
+        logger.info(f"Completed processing sheet: {sheet.title}")
+        
+    except Exception as e:
+        logger.error(f"Error processing sheet {sheet.title}: {str(e)}")
         raise
 
 # HTML template for the upload page
