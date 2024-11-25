@@ -1,4 +1,4 @@
-from flask import Flask, request, send_file, render_template_string
+from flask import Flask, request, send_file, render_template_string, jsonify
 import io
 import openpyxl
 from openpyxl.cell.cell import MergedCell
@@ -12,12 +12,52 @@ from functools import lru_cache
 from collections import defaultdict
 import threading
 import queue
+import time
+from datetime import datetime
+from werkzeug.utils import secure_filename
 
-# Set up logging
-logging.basicConfig(level=logging.INFO)
+# Constants and Configuration
+MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB limit
+ALLOWED_EXTENSIONS = {'xlsx', 'xls'}
+MAX_RETRIES = 3
+OLLAMA_API_URL = 'http://localhost:11434/api/generate'
+OLLAMA_MODEL = 'gemma2:latest'
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('translation_app.log')
+    ]
+)
 logger = logging.getLogger(__name__)
 
+def allowed_file(filename):
+    """Check if file extension is allowed."""
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def check_ollama_health():
+    """Check if Ollama service is running and model is available."""
+    try:
+        response = requests.post(
+            OLLAMA_API_URL,
+            json={'model': OLLAMA_MODEL, 'prompt': 'test', 'stream': False},
+            timeout=5
+        )
+        return response.status_code == 200
+    except Exception as e:
+        logger.error(f"Ollama health check failed: {str(e)}")
+        return False
+
 app = Flask(__name__)
+
+@app.before_request
+def before_request():
+    """Middleware to check service health before each request."""
+    if not check_ollama_health():
+        return jsonify({'error': 'Translation service is currently unavailable'}), 503
 
 # Thread-safe translation cache
 translation_cache = {}
@@ -194,19 +234,20 @@ def translate_text(text, context=None):
         return text
 
 def translate_with_context(text, context=None):
-    """Translate text with context awareness."""
-    try:
-        context_str = ""
-        if context:
-            # Limit context size
-            headers = ', '.join(context['headers'][:10])
-            common_terms = ', '.join(k for k, v in list(context['repeated_terms'].items())[:10])
-            date_formats = ', '.join(context['dates'][:5])
-            time_formats = ', '.join(context['times'][:5])
-            currency_formats = ', '.join(context['currencies'][:5])
-            bullet_types = ', '.join(context['bullet_types'][:5])
+    """Translate text with context awareness and retries."""
+    for attempt in range(MAX_RETRIES):
+        try:
+            context_str = ""
+            if context:
+                # Limit context size
+                headers = ', '.join(context['headers'][:10])
+                common_terms = ', '.join(k for k, v in list(context['repeated_terms'].items())[:10])
+                date_formats = ', '.join(context['dates'][:5])
+                time_formats = ', '.join(context['times'][:5])
+                currency_formats = ', '.join(context['currencies'][:5])
+                bullet_types = ', '.join(context['bullet_types'][:5])
 
-            context_str = f"""Document Context:
+                context_str = f"""Document Context:
 - Common Headers: {headers[:200]}
 - Frequent Terms: {common_terms[:200]}
 - Date Formats: {date_formats[:100]}
@@ -215,13 +256,13 @@ def translate_with_context(text, context=None):
 - Bullet Types: {bullet_types[:50]}
 """
 
-        # Limit prompt size
-        prompt = f"""You are a professional Korean to English translator specializing in business documents and Excel spreadsheets.
+            # Limit prompt size
+            prompt = f"""You are a professional Korean to English translator specializing in business documents and Excel spreadsheets.
 Please translate the following Korean text to English:
 
-Text to translate: {text[:600]}  # Limit input text size
+Text to translate: {text[:600]}
 
-{context_str[:1000]}  # Limit context size
+{context_str[:1000]}
 
 Translation requirements:
 1. Maintain all numbers, special characters, and formatting exactly as in the original
@@ -234,35 +275,43 @@ Translation requirements:
 Important: Provide ONLY the English translation without any explanations or notes.
 """
 
-        # Make the API call to Ollama with timeout
-        response = requests.post(
-            'http://localhost:11434/api/generate', 
-            json={
-                'model': 'mistral-nemo:latest',
-                'prompt': prompt,
-                'stream': False,
-                'temperature': 0.3,
-                'top_p': 0.9
-            },
-            timeout=30  # Add timeout
-        )
-        
-        if response.status_code == 200:
-            result = response.json()
-            translated_text = result['response'].strip()
-            translated_text = translated_text.strip('"\'')
-            logger.info(f"Translation completed: {translated_text[:200]}")  # Limit log size
-            return translated_text
-        else:
-            logger.error(f"Translation API error: {response.status_code}")
-            return text
+            # Make the API call to Ollama with timeout
+            response = requests.post(
+                OLLAMA_API_URL,
+                json={
+                    'model': OLLAMA_MODEL,
+                    'prompt': prompt,
+                    'stream': False,
+                    'temperature': 0.3,
+                    'top_p': 0.9
+                },
+                timeout=30
+            )
             
-    except requests.Timeout:
-        logger.error("Translation request timed out")
-        return text
-    except Exception as e:
-        logger.error(f"Translation error: {str(e)}")
-        return text
+            if response.status_code == 200:
+                result = response.json()
+                translated_text = result['response'].strip()
+                translated_text = translated_text.strip('"\'')
+                logger.info(f"Translation completed: {translated_text[:200]}")
+                return translated_text
+            else:
+                if attempt == MAX_RETRIES - 1:
+                    logger.error(f"Translation API error: {response.status_code}")
+                    return text
+                continue
+                
+        except requests.Timeout:
+            if attempt == MAX_RETRIES - 1:
+                logger.error("Translation request timed out")
+                return text
+            continue
+        except Exception as e:
+            if attempt == MAX_RETRIES - 1:
+                logger.error(f"Translation error: {str(e)}")
+                return text
+            continue
+        
+        time.sleep(1)  # Wait before retry
 
 def process_excel(file):
     logger.info("Starting Excel processing")
@@ -424,33 +473,53 @@ HTML_TEMPLATE = """
 @app.route('/', methods=['GET', 'POST'])
 def upload_file():
     if request.method == 'POST':
-        logger.info("Received POST request")
-        if 'file' not in request.files:
-            logger.warning("No file in request")
-            return render_template_string(HTML_TEMPLATE, error='No file uploaded')
-        
-        file = request.files['file']
-        if file.filename == '':
-            logger.warning("Empty filename")
-            return render_template_string(HTML_TEMPLATE, error='No file selected')
-        
-        if not file.filename.endswith('.xlsx'):
-            logger.warning("Invalid file type")
-            return render_template_string(HTML_TEMPLATE, error='Please upload an Excel (.xlsx) file')
-        
         try:
-            logger.info(f"Processing file: {file.filename}")
-            output = process_excel(file)
-            logger.info("File processing completed successfully")
-            return send_file(
-                output,
-                mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                as_attachment=True,
-                download_name=f"translated_{file.filename}"
-            )
+            # Check if file was uploaded
+            if 'file' not in request.files:
+                return jsonify({'error': 'No file uploaded'}), 400
+            
+            file = request.files['file']
+            if file.filename == '':
+                return jsonify({'error': 'No file selected'}), 400
+            
+            # Validate file type
+            if not allowed_file(file.filename):
+                return jsonify({'error': 'Invalid file type. Only Excel files (.xlsx, .xls) are allowed'}), 400
+            
+            # Check file size
+            file_content = file.read()
+            if len(file_content) > MAX_FILE_SIZE:
+                return jsonify({'error': 'File size exceeds 50MB limit'}), 400
+            
+            # Process file with retries
+            for attempt in range(MAX_RETRIES):
+                try:
+                    buffer = process_excel(io.BytesIO(file_content))
+                    
+                    # Create response
+                    output = io.BytesIO(buffer.getvalue())
+                    output.seek(0)
+                    
+                    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                    filename = f"translated_{timestamp}_{secure_filename(file.filename)}"
+                    
+                    return send_file(
+                        output,
+                        mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                        as_attachment=True,
+                        download_name=filename
+                    )
+                
+                except Exception as e:
+                    if attempt == MAX_RETRIES - 1:
+                        logger.error(f"Failed to process file after {MAX_RETRIES} attempts: {str(e)}")
+                        return jsonify({'error': 'Failed to process file. Please try again later.'}), 500
+                    logger.warning(f"Attempt {attempt + 1} failed, retrying...")
+                    time.sleep(1)  # Wait before retry
+            
         except Exception as e:
-            logger.error(f"Error processing file: {str(e)}", exc_info=True)
-            return render_template_string(HTML_TEMPLATE, error=f'An error occurred: {str(e)}')
+            logger.error(f"Upload error: {str(e)}")
+            return jsonify({'error': 'An unexpected error occurred'}), 500
     
     return render_template_string(HTML_TEMPLATE)
 
